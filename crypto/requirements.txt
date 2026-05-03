@@ -1,0 +1,17 @@
+pandas
+numpy
+matplotlib
+scikit-learn
+xgboost
+ta
+backtrader
+yfinance
+ccxt
+tensorflow
+keras
+torch
+stable-baselines3[extra]
+gym
+optuna
+notebook
+jupyterlab
