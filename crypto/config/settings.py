@@ -21,7 +21,7 @@ EXCHANGE    = os.getenv("EXCHANGE",    "binance")
 SYMBOL      = os.getenv("SYMBOL",     "BTC/USDT")
 PRIMARY_TF  = os.getenv("PRIMARY_TF", "1h")
 HIGHER_TF   = os.getenv("HIGHER_TF",  "1d")
-START_DATE  = os.getenv("START_DATE", "2020-01-01")
+START_DATE  = os.getenv("START_DATE", "2010-01-01")
 
 # ── Trading Parameters ────────────────────────────────────────────────────────
 INITIAL_CAPITAL   = float(os.getenv("INITIAL_CAPITAL",   "10000.0"))

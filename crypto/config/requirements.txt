@@ -5,7 +5,7 @@
 
 # Data
 pandas==3.0.2
-numpy==2.4.4
+numpy==1.26.4
 pyarrow==16.0.0
 requests==2.33.1
 ccxt==4.5.51
@@ -46,3 +46,4 @@ python-dotenv==1.2.2
 pydantic==2.7.1
 loguru==0.7.3
 pytest==8.2.0
+mlflow==2.13.0
