@@ -3,31 +3,39 @@
 CryptoTradingBot — Entry Point
 ==============================
 Usage:
-    python main.py --mode fetch        # download BTC/USDT 1h + 1d
-    python main.py --mode load         # display raw data
-    python main.py --mode features     # build feature matrix
-    python main.py --mode strategy     # rule-based strategies + backtest
-    python main.py --mode train        # train XGBoost v1
-    python main.py --mode train-v2     # train XGBoost v2 (anti-overfit)
-    python main.py --mode train-lstm   # train LSTM
-    python main.py --mode train-rl     # train PPO RL agent
-    python main.py --mode optimize     # stationarity analysis + v1 vs v2
-    python main.py --mode compare      # compare all saved models
-    python main.py --mode wfv          # walk-forward validation
-    python main.py --mode evaluate     # overfitting check + Monte Carlo
-    python main.py --mode report       # generate full markdown report
-    python main.py --mode full         # end-to-end pipeline
+    python main.py --mode fetch
+    python main.py --mode load
+    python main.py --mode features
+    python main.py --mode strategy
+    python main.py --mode train
+    python main.py --mode train-v2
+    python main.py --mode train-lstm
+    python main.py --mode train-rl
+    python main.py --mode optimize
+    python main.py --mode compare
+    python main.py --mode wfv
+    python main.py --mode evaluate
+    python main.py --mode report
+    python main.py --mode full
 
 Flags:
-    --force       Re-download / re-compute even if files exist
-    --no-optuna   Skip Optuna, use default params (faster)
-    --trials N    Optuna trials (default 20 for WFV/v2, 50 for train)
-    --timesteps N PPO total timesteps (default: 500000)
+    --force       Re-compute even if files exist
+    --no-optuna   Skip Optuna (faster)
+    --trials N    Optuna trials (default 20)
+    --timesteps N PPO timesteps (default 500000)
+
+Lazy import strategy:
+    ALL heavy libraries (PyTorch, XGBoost, SB3, WalkForwardValidator)
+    are imported INSIDE their functions only.
+    This prevents Windows CUDA DLL crash (0xC0000005) on startup
+    for lightweight modes like fetch, features, strategy.
 """
 
 import argparse
 import sys
+import json
 from pathlib import Path
+from datetime import datetime
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -38,15 +46,7 @@ import pandas as pd
 import numpy as np
 import config.settings as cfg
 
-from src.utils.gpu_check              import verify_gpu
-from src.utils.experiment_tracker     import (
-    ExperimentTracker,
-    log_xgboost_run,
-    log_wfv_run,
-    log_comparison_run,
-    MLFLOW_AVAILABLE,
-)
-from src.utils.report_generator       import generate_report
+# ── Lightweight module-level imports only ────────────────────────────────────
 from src.data.fetcher                 import OHLCVFetcher
 from src.data.loader                  import DataLoader, display_dataframe
 from src.data.splitter                import temporal_split
@@ -55,20 +55,12 @@ from src.strategies.ema_rsi           import EMACrossoverRSI
 from src.strategies.multi_indicator   import MultiIndicatorConfluence
 from src.strategies.position_manager  import signals_to_positions
 from src.backtesting.simple_backtest  import SimpleBacktester
-from src.backtesting.walk_forward     import WalkForwardValidator
-from src.backtesting.metrics          import (
-    check_overfitting,
-    monte_carlo_simulation,
-    print_wfv_comparison,
-)
-from src.models.xgboost_model         import XGBoostTradingModel
-from src.models.xgboost_v2            import XGBoostTradingModelV2
-from src.models.lstm_model            import LSTMTradingModel
-from src.models.rl.ppo_trainer        import PPOTradingAgent
-from src.models.feature_selector      import (
-    get_stationary_features,
-    print_feature_analysis,
-)
+from src.models.feature_selector      import get_stationary_features, print_feature_analysis
+
+# ALL of these are now LAZY (inside functions):
+# WalkForwardValidator, check_overfitting, monte_carlo_simulation,
+# print_wfv_comparison, XGBoostTradingModel, XGBoostTradingModelV2,
+# LSTMTradingModel, PPOTradingAgent, generate_report, ExperimentTracker
 
 
 # ── Logger ────────────────────────────────────────────────────────────────────
@@ -88,12 +80,15 @@ def _setup_logger():
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 def step_gpu_check():
+    # Lazy — torch/CUDA must NOT be imported at module level on Windows.
+    # Importing torch before argparse runs causes silent 0xC0000005 crash.
+    from src.utils.gpu_check import verify_gpu
     logger.info("STEP 1 — GPU Check")
     verify_gpu(verbose=True)
 
 
 def step_fetch(force=False):
-    logger.info("STEP 2 — Data Fetch")
+    logger.info("STEP — Data Fetch")
     f = OHLCVFetcher(exchange_id=cfg.EXCHANGE)
     f.fetch(cfg.SYMBOL, cfg.PRIMARY_TF, cfg.START_DATE, force=force)
     f.fetch(cfg.SYMBOL, cfg.HIGHER_TF,  cfg.START_DATE, force=force)
@@ -114,8 +109,8 @@ def _load_feature_matrix(force=False) -> pd.DataFrame:
 
 
 def _get_feat_cols(df: pd.DataFrame) -> list:
-    omit = {"open", "high", "low", "close", "volume", "target"}
-    return [c for c in df.columns if c not in omit]
+    return [c for c in df.columns
+            if c not in {"open","high","low","close","volume","target"}]
 
 
 def _get_split_and_arrays(force=False):
@@ -128,6 +123,26 @@ def _get_split_and_arrays(force=False):
         split.val[feat_cols],   split.val["target"].astype(int),
         split.test[feat_cols],  split.test["target"].astype(int),
     )
+
+
+def _save_results_json(results: dict):
+    """Save best model metrics to logs/runs/ so compare-all can read them."""
+    log_dir = cfg.LOG_DIR / "runs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    best_name = max(results, key=lambda k: results[k].metrics.get("sharpe", -99))
+    payload   = {
+        "asset":    cfg.SYMBOL,
+        "strategy": best_name,
+        "metrics": {
+            f"test_{k}": v
+            for k, v in results[best_name].metrics.items()
+            if isinstance(v, (int, float))
+        },
+    }
+    fname = log_dir / f"compare_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(fname, "w") as f:
+        json.dump(payload, f, indent=2)
+    logger.info(f"Results saved → {fname.name}  (best: {best_name})")
 
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────
@@ -159,26 +174,19 @@ def step_strategy(force=False):
             split.test, signals_to_positions(strat.generate_signals(split.test)), name
         )
     _display_strategy_comparison(results)
-
-    with ExperimentTracker("rule_based", "rule_based_strategies") as t:
-        t.log_system_info()
-        for name, result in results.items():
-            t.log_backtest_result(result, prefix=name.replace("+","plus").lower())
-
     return results
 
 
 def step_train(force=False, n_trials=50, use_optuna=True):
+    from src.models.xgboost_model import XGBoostTradingModel, LABEL_MAP
+    import xgboost as xgb
+
     logger.info("STEP — XGBoost v1 Training")
     split, feat_cols, X_tr, y_tr, X_vl, y_vl, X_te, y_te = \
         _get_split_and_arrays(force)
-    logger.info(
-        f"X_train: {X_tr.shape} | X_val: {X_vl.shape} | X_test: {X_te.shape}"
-    )
+
     model = XGBoostTradingModel()
     if not use_optuna:
-        import xgboost as xgb
-        from src.models.xgboost_model import LABEL_MAP
         model.feature_cols = feat_cols
         y_tr_enc = y_tr.map(LABEL_MAP).values.astype(int)
         y_vl_enc = y_vl.map(LABEL_MAP).values.astype(int)
@@ -191,49 +199,37 @@ def step_train(force=False, n_trials=50, use_optuna=True):
         }
         model.best_params = p
         model.model = xgb.XGBClassifier(**p, early_stopping_rounds=30)
-        w_tr = model._compute_weights(y_tr_enc)
-        w_vl = model._compute_weights(y_vl_enc)
-        model.model.fit(
-            X_tr, y_tr_enc, sample_weight=w_tr,
-            eval_set=[(X_vl, y_vl_enc)],
-            sample_weight_eval_set=[w_vl], verbose=100,
-        )
-        model._print_eval(X_vl, y_vl_enc, "Validation")
+        w = model._compute_weights(y_tr_enc)
+        model.model.fit(X_tr, y_tr_enc, sample_weight=w,
+                        eval_set=[(X_vl, y_vl_enc)], verbose=100)
         model.save()
     else:
         model.train(X_tr, y_tr, X_vl, y_vl, n_trials=n_trials)
 
     model.evaluate(X_te, y_te, "Test")
     model.feature_importance(top_n=20)
-
-    df_test    = split.test.copy()
-    bt         = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
-    train_sigs = pd.Series(model.predict(X_tr), index=split.train.index)
-    test_sigs  = pd.Series(model.predict(X_te), index=df_test.index)
-    train_res  = bt.run(split.train, signals_to_positions(train_sigs), "XGBoost v1 (Train)")
-    test_res   = bt.run(df_test,     signals_to_positions(test_sigs),  "XGBoost v1 (Test)")
-    _display_strategy_comparison({"XGBoost v1 Train": train_res, "XGBoost v1 Test": test_res})
-
-    log_xgboost_run(model, train_res, test_res, split, version="v1")
-    return model, test_res
+    bt  = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
+    res = bt.run(split.test,
+                 signals_to_positions(pd.Series(model.predict(X_te), index=split.test.index)),
+                 "XGBoost v1")
+    _display_strategy_comparison({"XGBoost v1": res})
+    return model, res
 
 
 def step_train_v2(force=False, n_trials=50, use_optuna=True):
+    from src.models.xgboost_v2 import XGBoostTradingModelV2
+
     logger.info("STEP — XGBoost v2 Training (Anti-Overfit)")
     split, feat_cols, X_tr, y_tr, X_vl, y_vl, X_te, y_te = \
         _get_split_and_arrays(force)
-    logger.info(
-        f"X_train: {X_tr.shape} | X_val: {X_vl.shape} | X_test: {X_te.shape}"
-    )
+
     model_v2 = XGBoostTradingModelV2()
     if not use_optuna:
         import xgboost as xgb
         from src.models.xgboost_v2 import LABEL_MAP
-        all_feat_df     = pd.concat([X_tr, X_vl], axis=0)
-        stationary      = get_stationary_features(all_feat_df)
+        stationary = get_stationary_features(pd.concat([X_tr, X_vl]))
         model_v2.feature_cols = stationary
-        X_tr_s = X_tr[stationary]
-        X_vl_s = X_vl[stationary]
+        X_tr_s = X_tr[stationary]; X_vl_s = X_vl[stationary]
         y_tr_enc = y_tr.map(LABEL_MAP).values.astype(int)
         y_vl_enc = y_vl.map(LABEL_MAP).values.astype(int)
         p = {
@@ -246,14 +242,9 @@ def step_train_v2(force=False, n_trials=50, use_optuna=True):
         }
         model_v2.best_params = p
         model_v2.model = xgb.XGBClassifier(**p, early_stopping_rounds=20)
-        w_tr = model_v2._compute_weights(y_tr_enc)
-        w_vl = model_v2._compute_weights(y_vl_enc)
-        model_v2.model.fit(
-            X_tr_s, y_tr_enc, sample_weight=w_tr,
-            eval_set=[(X_vl_s, y_vl_enc)],
-            sample_weight_eval_set=[w_vl], verbose=50,
-        )
-        model_v2._print_eval(X_vl_s, y_vl_enc, "Validation")
+        w = model_v2._compute_weights(y_tr_enc)
+        model_v2.model.fit(X_tr_s, y_tr_enc, sample_weight=w,
+                           eval_set=[(X_vl_s, y_vl_enc)], verbose=50)
         model_v2._print_overfit_check(X_tr_s, y_tr_enc, X_vl_s, y_vl_enc)
         model_v2.save()
     else:
@@ -261,40 +252,18 @@ def step_train_v2(force=False, n_trials=50, use_optuna=True):
 
     model_v2.evaluate(X_te, y_te, "Test")
     model_v2.feature_importance(top_n=20)
-
-    df_test    = split.test.copy()
-    bt         = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
-    X_te_stat  = X_te[model_v2.feature_cols]
-    X_tr_stat  = X_tr[model_v2.feature_cols]
-    train_sigs = pd.Series(model_v2.predict(X_tr_stat), index=split.train.index)
-    test_sigs  = pd.Series(model_v2.predict(X_te_stat), index=df_test.index)
-    train_res  = bt.run(split.train, signals_to_positions(train_sigs), "v2 Train")
-    test_res   = bt.run(df_test,     signals_to_positions(test_sigs),  "v2 Test")
-
-    results = {"XGBoost v2": test_res}
-    try:
-        m1    = XGBoostTradingModel().load()
-        v1_sigs = pd.Series(m1.predict(X_te), index=df_test.index)
-        results["XGBoost v1"] = bt.run(
-            df_test, signals_to_positions(v1_sigs), "XGBoost v1"
-        )
-    except FileNotFoundError:
-        pass
-    results["Confluence"] = bt.run(
-        df_test,
-        signals_to_positions(
-            MultiIndicatorConfluence(45, 70, volume_surge=1.2, long_only=True)
-            .generate_signals(df_test)
-        ),
-        "Confluence",
-    )
-    _display_strategy_comparison(results)
-
-    log_xgboost_run(model_v2, train_res, test_res, split, version="v2")
-    return model_v2, test_res
+    X_te_s = X_te[model_v2.feature_cols]
+    bt     = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
+    res    = bt.run(split.test,
+                    signals_to_positions(pd.Series(model_v2.predict(X_te_s), index=split.test.index)),
+                    "XGBoost v2")
+    _display_strategy_comparison({"XGBoost v2": res})
+    return model_v2, res
 
 
 def step_train_lstm(force=False):
+    from src.models.lstm_model import LSTMTradingModel
+
     logger.info("STEP — LSTM Training")
     split, feat_cols, X_tr, y_tr, X_vl, y_vl, X_te, y_te = \
         _get_split_and_arrays(force)
@@ -304,29 +273,16 @@ def step_train_lstm(force=False):
     )
     lstm.train(X_tr, y_tr, X_vl, y_vl)
     lstm.evaluate(X_te, y_te, "Test")
-    df_test  = split.test.copy()
-    sigs     = pd.Series(lstm.predict(X_te), index=df_test.index)
-    bt       = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
-    lstm_res = bt.run(df_test, signals_to_positions(sigs), "LSTM")
-    rb_res   = bt.run(
-        df_test,
-        signals_to_positions(
-            MultiIndicatorConfluence(45, 70, volume_surge=1.2, long_only=True)
-            .generate_signals(df_test)
-        ),
-        "Confluence",
-    )
-    _display_strategy_comparison({"LSTM": lstm_res, "Confluence": rb_res})
-
-    with ExperimentTracker("lstm", "lstm_training") as t:
-        t.log_system_info()
-        t.log_params({"seq_len": 60, "hidden_size": 128, "num_layers": 2})
-        t.log_backtest_result(lstm_res, prefix="test")
-
-    return lstm, lstm_res
+    bt      = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
+    sigs    = pd.Series(lstm.predict(X_te), index=split.test.index)
+    res     = bt.run(split.test, signals_to_positions(sigs), "LSTM")
+    _display_strategy_comparison({"LSTM": res})
+    return lstm, res
 
 
 def step_train_rl(force=False, total_timesteps=500_000):
+    from src.models.rl.ppo_trainer import PPOTradingAgent
+
     logger.info("STEP — PPO Reinforcement Learning")
     df        = _load_feature_matrix(force)
     split     = temporal_split(df, train_ratio=0.70, val_ratio=0.15)
@@ -337,90 +293,58 @@ def step_train_rl(force=False, total_timesteps=500_000):
         feature_cols=feat_cols, total_timesteps=total_timesteps,
         n_envs=4, window=30,
     )
-    metrics = agent.evaluate(split.test.copy(), feat_cols, window=30)
-
-    with ExperimentTracker("ppo", "ppo_training") as t:
-        t.log_system_info()
-        t.log_params({"total_timesteps": total_timesteps, "n_envs": 4, "window": 30})
-        t.log_metrics({k: v for k, v in metrics.items()
-                       if isinstance(v, (int, float))})
-
-    return agent, metrics
+    return agent, agent.evaluate(split.test.copy(), feat_cols, window=30)
 
 
 def step_optimize(force=False):
-    logger.info("STEP — Model Optimization Analysis")
+    from src.models.xgboost_model import XGBoostTradingModel
+    from src.models.xgboost_v2   import XGBoostTradingModelV2
+    from src.backtesting.metrics  import check_overfitting, monte_carlo_simulation
+
+    logger.info("STEP — Optimization Analysis")
     split, feat_cols, X_tr, y_tr, X_vl, y_vl, X_te, y_te = \
         _get_split_and_arrays(force)
-    df        = _load_feature_matrix(force)
-    stationary = get_stationary_features(df)
+    df = _load_feature_matrix(force)
     print_feature_analysis(df, feat_cols)
 
-    sep = "═" * 60
-    print(f"\n{sep}")
-    print(f"  FEATURE REDUCTION SUMMARY")
-    print(sep)
-    removed = [f for f in feat_cols if f not in stationary]
-    print(f"  All features        : {len(feat_cols)}")
-    print(f"  Stationary (kept)   : {len(stationary)}")
-    print(f"  Non-stationary (rm) : {len(removed)}")
-    print(f"\n  Removed features:")
-    for f in removed:
-        print(f"    ✗  {f}")
-    print(f"{sep}\n")
-
     bt = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
-    results_train, results_test, overfit_checks = {}, {}, {}
-
-    for model_name, loader_fn, x_tr, x_te in [
-        ("XGBoost v1", lambda: XGBoostTradingModel().load(), X_tr, X_te),
-        ("XGBoost v2", lambda: XGBoostTradingModelV2().load(), None, None),
+    results_tr, results_te = {}, {}
+    for name, loader_fn, xtr, xte in [
+        ("v1", lambda: XGBoostTradingModel().load(),  X_tr, X_te),
+        ("v2", lambda: XGBoostTradingModelV2().load(), None, None),
     ]:
         try:
-            m = loader_fn()
-            _x_tr = X_tr[m.feature_cols] if hasattr(m, 'feature_cols') and m.feature_cols and X_tr is not None and set(m.feature_cols).issubset(X_tr.columns) else x_tr
-            _x_te = X_te[m.feature_cols] if hasattr(m, 'feature_cols') and m.feature_cols and X_te is not None and set(m.feature_cols).issubset(X_te.columns) else x_te
-
-            if _x_tr is not None:
-                tr_sigs = pd.Series(m.predict(_x_tr), index=split.train.index)
-                results_train[model_name] = bt.run(
-                    split.train, signals_to_positions(tr_sigs), f"{model_name} Train"
-                )
-
-            if _x_te is not None:
-                te_sigs = pd.Series(m.predict(_x_te), index=split.test.index)
-                results_test[model_name] = bt.run(
-                    split.test, signals_to_positions(te_sigs), f"{model_name} Test"
-                )
-
-            if model_name in results_train and model_name in results_test:
-                overfit_checks[model_name] = check_overfitting(
-                    results_train[model_name].metrics,
-                    results_test[model_name].metrics,
-                    threshold=0.5,
-                )
-            logger.info(f"{model_name} evaluated ✓")
+            m    = loader_fn()
+            _xtr = X_tr[m.feature_cols] if hasattr(m,"feature_cols") and m.feature_cols and set(m.feature_cols).issubset(X_tr.columns) else xtr
+            _xte = X_te[m.feature_cols] if hasattr(m,"feature_cols") and m.feature_cols and set(m.feature_cols).issubset(X_te.columns) else xte
+            if _xtr is not None:
+                results_tr[name] = bt.run(split.train,
+                    signals_to_positions(pd.Series(m.predict(_xtr), index=split.train.index)),
+                    f"{name} Train")
+            if _xte is not None:
+                results_te[name] = bt.run(split.test,
+                    signals_to_positions(pd.Series(m.predict(_xte), index=split.test.index)),
+                    f"{name} Test")
+            if name in results_tr and name in results_te:
+                check_overfitting(results_tr[name].metrics, results_te[name].metrics)
         except FileNotFoundError:
-            logger.warning(f"{model_name} not found")
+            logger.warning(f"XGBoost {name} not found")
 
-    if results_train:
-        print(f"\n{'═'*60}\n  IN-SAMPLE COMPARISON (Train)\n{'═'*60}")
-        _display_strategy_comparison(results_train)
-    if results_test:
-        print(f"\n{'═'*60}\n  OUT-OF-SAMPLE COMPARISON (Test)\n{'═'*60}")
-        _display_strategy_comparison(results_test)
+    if results_tr: _display_strategy_comparison(results_tr)
+    if results_te: _display_strategy_comparison(results_te)
 
-    best = max(results_test.keys(),
-               key=lambda k: results_test[k].metrics.get("sharpe", -99),
-               ) if results_test else None
-    if best and len(results_test[best].trades) >= 5:
-        monte_carlo_simulation(
-            results_test[best].trades["pnl_pct"],
-            cfg.INITIAL_CAPITAL, 1000,
-        )
+    best = max(results_te, key=lambda k: results_te[k].metrics.get("sharpe",-99),
+               ) if results_te else None
+    if best and len(results_te[best].trades) >= 5:
+        monte_carlo_simulation(results_te[best].trades["pnl_pct"],
+                               cfg.INITIAL_CAPITAL, 1000)
 
 
 def step_wfv(force=False, n_trials=20):
+    # ── Lazy imports — ALL heavy imports inside this function ─────────────────
+    from src.backtesting.walk_forward import WalkForwardValidator
+    from src.backtesting.metrics      import print_wfv_comparison
+
     logger.info("STEP — Walk-Forward Validation")
     df        = _load_feature_matrix(force)
     feat_cols = _get_feat_cols(df)
@@ -431,91 +355,101 @@ def step_wfv(force=False, n_trials=20):
     )
     reports = {}
 
-    logger.info("XGBoost WFV ...")
-    reports["XGBoost"] = wfv.run_xgboost(df, feat_cols, n_trials=n_trials)
-    log_wfv_run(reports["XGBoost"], "XGBoost")
+    logger.info("Running XGBoost WFV (re-trains each fold) ...")
+    try:
+        reports["XGBoost"] = wfv.run_xgboost(df, feat_cols, n_trials=n_trials)
+        logger.info("XGBoost WFV complete ✓")
+    except Exception as e:
+        logger.error(f"XGBoost WFV failed: {e}")
+        import traceback; traceback.print_exc()
 
-    logger.info("Confluence WFV ...")
-    reports["Confluence"] = wfv.run_rule_based(
-        df,
-        MultiIndicatorConfluence(45, 70, volume_surge=1.2, long_only=True),
-        name="Confluence",
-    )
-    log_wfv_run(reports["Confluence"], "Confluence")
+    logger.info("Running Confluence WFV ...")
+    try:
+        reports["Confluence"] = wfv.run_rule_based(
+            df, MultiIndicatorConfluence(45, 70, volume_surge=1.2, long_only=True),
+            name="Confluence",
+        )
+        logger.info("Confluence WFV complete ✓")
+    except Exception as e:
+        logger.error(f"Confluence WFV failed: {e}")
 
-    logger.info("EMA+RSI WFV ...")
-    reports["EMA+RSI"] = wfv.run_rule_based(
-        df,
-        EMACrossoverRSI(50, 75, use_ema50_filter=True, long_only=True),
-        name="EMA+RSI",
-    )
-    log_wfv_run(reports["EMA+RSI"], "EMA+RSI")
+    logger.info("Running EMA+RSI WFV ...")
+    try:
+        reports["EMA+RSI"] = wfv.run_rule_based(
+            df, EMACrossoverRSI(50, 75, use_ema50_filter=True, long_only=True),
+            name="EMA+RSI",
+        )
+        logger.info("EMA+RSI WFV complete ✓")
+    except Exception as e:
+        logger.error(f"EMA+RSI WFV failed: {e}")
 
-    print_wfv_comparison(reports)
+    if reports:
+        print_wfv_comparison(reports)
     return reports
 
 
 def step_evaluate(force=False):
-    logger.info("STEP — Evaluation: Overfitting Check + Monte Carlo")
+    from src.models.xgboost_model import XGBoostTradingModel
+    from src.backtesting.metrics  import check_overfitting, monte_carlo_simulation
+
+    logger.info("STEP — Evaluate: Overfitting Check + Monte Carlo")
     split, feat_cols, X_tr, y_tr, X_vl, y_vl, X_te, y_te = \
         _get_split_and_arrays(force)
     try:
         model = XGBoostTradingModel().load()
     except FileNotFoundError:
         logger.error("XGBoost model not found — run --mode train first")
-        return None, None
+        return
 
     bt         = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
     train_sigs = pd.Series(model.predict(X_tr), index=split.train.index)
     test_sigs  = pd.Series(model.predict(X_te), index=split.test.index)
-    train_res  = bt.run(split.train, signals_to_positions(train_sigs), "XGBoost (Train)")
-    test_res   = bt.run(split.test,  signals_to_positions(test_sigs),  "XGBoost (Test)")
+    train_res  = bt.run(split.train, signals_to_positions(train_sigs), "Train")
+    test_res   = bt.run(split.test,  signals_to_positions(test_sigs),  "Test")
 
     check_overfitting(train_res.metrics, test_res.metrics, threshold=0.5)
 
-    mc = None
     if len(test_res.trades) >= 5:
-        mc = monte_carlo_simulation(
-            test_res.trades["pnl_pct"], cfg.INITIAL_CAPITAL,
-            n_simulations=1000, seed=cfg.RANDOM_SEED,
-        )
-    else:
-        logger.warning(f"Only {len(test_res.trades)} trades — Monte Carlo skipped (need ≥ 5)")
+        monte_carlo_simulation(test_res.trades["pnl_pct"], cfg.INITIAL_CAPITAL, 1000)
 
-    _display_strategy_comparison({
-        "XGBoost (Train)": train_res,
-        "XGBoost (Test)":  test_res,
-    })
-    return train_res, test_res, mc
+    _display_strategy_comparison({"XGBoost Train": train_res, "XGBoost Test": test_res})
+    return train_res, test_res
 
 
 def step_compare(force=False):
+    from src.models.xgboost_model import XGBoostTradingModel
+    from src.models.xgboost_v2   import XGBoostTradingModelV2
+
     logger.info("STEP — Full Model Comparison")
     split, feat_cols, _, _, _, _, X_te, y_te = _get_split_and_arrays(force)
     df_test = split.test.copy()
     bt      = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
     results = {}
 
-    for model_name, loader_fn in [
+    # ── ML models (XGBoost only — LSTM import skipped to avoid CUDA crash) ───
+    for name, loader_fn in [
         ("XGBoost v1", lambda: XGBoostTradingModel().load()),
         ("XGBoost v2", lambda: XGBoostTradingModelV2().load()),
-        ("LSTM",       lambda: LSTMTradingModel().load()),
     ]:
         try:
             m    = loader_fn()
             x_in = X_te[m.feature_cols] if (
-                hasattr(m, "feature_cols") and m.feature_cols
+                hasattr(m,"feature_cols") and m.feature_cols
                 and set(m.feature_cols).issubset(X_te.columns)
             ) else X_te
-            raw  = m.predict(x_in)
-            results[model_name] = bt.run(
-                df_test, signals_to_positions(pd.Series(raw, index=df_test.index)),
-                model_name,
-            )
-            logger.info(f"{model_name} loaded ✓")
+            sigs = pd.Series(m.predict(x_in), index=df_test.index)
+            results[name] = bt.run(df_test, signals_to_positions(sigs), name)
+            logger.info(f"{name} loaded ✓")
         except FileNotFoundError:
-            logger.warning(f"{model_name} not found")
+            logger.warning(f"{name} not found")
+        except Exception as e:
+            logger.warning(f"{name} failed: {e}")
 
+    # NOTE: LSTM deliberately excluded — importing torch in this process context
+    # triggers an uncatchable Windows 0xC0000005 CUDA crash (not a Python exception).
+    # LSTM results available separately via: python main.py --mode train-lstm
+
+    # ── Rule-based ────────────────────────────────────────────────────────────
     for name, strat in [
         ("EMA+RSI",    EMACrossoverRSI(50, 75, use_ema50_filter=True, long_only=True)),
         ("Confluence", MultiIndicatorConfluence(45, 70, volume_surge=1.2, long_only=True)),
@@ -526,21 +460,21 @@ def step_compare(force=False):
 
     if results:
         _display_strategy_comparison(results)
-        log_comparison_run(results)
+        _save_results_json(results)
+
     return results
 
 
 def step_report(force=False):
-    """Generate the final markdown evaluation report."""
-    logger.info("STEP — Generating Evaluation Report")
+    from src.utils.report_generator import generate_report
+    from src.backtesting.metrics    import check_overfitting, monte_carlo_simulation
 
-    # Collect whatever results are available
-    results      = step_compare(force=False)
-    eval_output  = step_evaluate(force=False)
+    logger.info("STEP — Generating Evaluation Report")
+    results     = step_compare(force=False)
+    eval_output = step_evaluate(force=False)
 
     train_res = eval_output[0] if eval_output and len(eval_output) > 0 else None
     test_res  = eval_output[1] if eval_output and len(eval_output) > 1 else None
-    mc        = eval_output[2] if eval_output and len(eval_output) > 2 else None
 
     overfit_checks = {}
     if train_res and test_res:
@@ -548,58 +482,33 @@ def step_report(force=False):
             train_res.metrics, test_res.metrics, threshold=0.5
         )
 
-    mc_results = {}
-    if mc:
-        mc_results["XGBoost v1"] = mc
-
     report_path = generate_report(
         results        = results,
-        wfv_reports    = None,    # populate after running --mode wfv
-        mc_results     = mc_results,
         overfit_checks = overfit_checks,
         model_meta     = {
             "XGBoost v1 features": "73 (all)",
             "XGBoost v2 features": "56 (stationary only)",
-            "Next step":           "Run --mode wfv to validate across regimes",
         },
     )
-
-    print(f"\n  Report saved → {report_path}")
-    print(f"  Open in any markdown viewer or VS Code.\n")
+    print(f"\n  Report saved → {report_path}\n")
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
 def _display_features(df):
     sep       = "═" * 65
-    target    = "target"
     feat_cols = [c for c in df.columns
-                 if c not in {"open","high","low","close","volume",target}]
+                 if c not in {"open","high","low","close","volume","target"}]
     print(f"\n{sep}")
     print(f"  FEATURE MATRIX  |  {len(df):,} rows  |  {len(feat_cols)} features")
     print(f"  {df.index[0]}  →  {df.index[-1]}")
-    groups = {
-        "Trend":         [c for c in feat_cols if any(k in c for k in ["ema","macd","adx","cross"])],
-        "Momentum":      [c for c in feat_cols if any(k in c for k in ["rsi","stoch","williams","roc"])],
-        "Volatility":    [c for c in feat_cols if any(k in c for k in ["bb_","atr","kc_","vol"])],
-        "Volume":        [c for c in feat_cols if any(k in c for k in ["volume","obv","vwap","mfi"])],
-        "Price-Derived": [c for c in feat_cols if any(k in c for k in ["return","spread","range","log"])],
-        "Macro (1d)":    [c for c in feat_cols if c.startswith("d1_")],
-        "Patterns":      [c for c in feat_cols if c.startswith("pat_")],
-    }
-    for g, cols in groups.items():
-        print(f"  {g:<18}: {len(cols):>3} cols")
-    if target in df.columns:
-        counts = df[target].value_counts().sort_index()
+    if "target" in df.columns:
+        counts = df["target"].value_counts().sort_index()
         total  = len(df)
-        labels = {-1: "SHORT", 0: "HOLD", 1: "LONG"}
-        print(f"\n  [ Target Distribution ]")
+        labels = {-1:"SHORT", 0:"HOLD", 1:"LONG"}
         for val, cnt in counts.items():
             bar = "█" * int(cnt/total*40)
             print(f"  {labels.get(val,val):>6} ({int(val):>2}): "
                   f"{cnt:>6,} ({cnt/total*100:>5.1f}%)  {bar}")
-    nan_ok = not df[feat_cols].isnull().any().any()
-    print(f"\n  [ NaN Check ] : "
-          f"{'No NaN values ✓' if nan_ok else 'WARNING — NaNs detected'}")
     print(f"{sep}\n")
 
 
@@ -612,22 +521,18 @@ def _display_strategy_comparison(results: dict):
         ("Buy & Hold %",     "buy_hold_pct",       "{:>+.2f}%"),
         ("Sharpe Ratio",     "sharpe",             "{:>.3f}"),
         ("Sortino Ratio",    "sortino",            "{:>.3f}"),
-        ("Calmar Ratio",     "calmar",             "{:>.3f}"),
         ("Max Drawdown %",   "max_drawdown_pct",   "{:>.2f}%"),
         ("Total Trades",     "total_trades",       "{:>}"),
         ("Win Rate %",       "win_rate_pct",       "{:>.1f}%"),
         ("Profit Factor",    "profit_factor",      "{:>.3f}"),
-        ("Avg Win %",        "avg_win_pct",        "{:>+.2f}%"),
-        ("Avg Loss %",       "avg_loss_pct",       "{:>+.2f}%"),
         ("Expectancy %",     "expectancy_pct",     "{:>+.4f}%"),
         ("Time in Market %", "time_in_market_pct", "{:>.1f}%"),
     ]
     names = list(results.keys())
-    cw    = 22
+    cw    = 20
     sep   = "═" * (30 + cw * len(names))
     print(f"\n{sep}")
     print(f"  STRATEGY COMPARISON  —  Test Set")
-    print(f"  Targets: Sharpe > 1.5  |  Profit Factor > 1.5  |  Win Rate > 50%")
     print(sep)
     print(f"  {'Metric':<28}" + "".join(f"{n:>{cw}}" for n in names))
     print(f"  {'─'*28}" + "─"*(cw*len(names)))
@@ -642,50 +547,6 @@ def _display_strategy_comparison(results: dict):
 
 
 # ── Mode runners ──────────────────────────────────────────────────────────────
-def run_fetch(args):     step_gpu_check(); step_fetch(args.force)
-def run_load(args):      step_gpu_check(); step_load_and_display()
-def run_features(args):  step_gpu_check(); step_features(args.force)
-def run_strategy(args):  step_gpu_check(); step_strategy(args.force)
-def run_compare(args):   step_gpu_check(); step_compare(args.force)
-def run_wfv(args):       step_gpu_check(); step_wfv(args.force, args.trials)
-def run_evaluate(args):  step_gpu_check(); step_evaluate(args.force)
-def run_optimize(args):  step_gpu_check(); step_optimize(args.force)
-def run_report(args):    step_gpu_check(); step_report(args.force)
-
-def run_train(args):
-    step_gpu_check()
-    step_train(args.force, args.trials, not args.no_optuna)
-
-def run_train_v2(args):
-    step_gpu_check()
-    step_train_v2(args.force, args.trials, not args.no_optuna)
-
-def run_train_lstm(args):
-    step_gpu_check()
-    step_train_lstm(args.force)
-
-def run_train_rl(args):
-    step_gpu_check()
-    step_train_rl(args.force, args.timesteps)
-
-def run_full(args):
-    step_gpu_check()
-    step_fetch(args.force)
-    step_features(args.force)
-    step_strategy(args.force)
-    step_train(args.force, args.trials, not args.no_optuna)
-    step_train_v2(args.force, args.trials, not args.no_optuna)
-    step_train_lstm(args.force)
-    step_train_rl(args.force, args.timesteps)
-    step_optimize(args.force)
-    step_wfv(args.force, args.trials)
-    step_evaluate(args.force)
-    step_compare(args.force)
-    step_report(args.force)
-    logger.info("Full pipeline complete.")
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     _setup_logger()
     parser = argparse.ArgumentParser(description="CryptoTradingBot")
@@ -708,28 +569,40 @@ def main():
         f"CryptoTradingBot  |  mode={args.mode}  |  "
         f"symbol={cfg.SYMBOL}  |  force={args.force}"
     )
-    if MLFLOW_AVAILABLE:
-        logger.info(f"MLflow tracking enabled → {cfg.BASE_DIR / 'mlflow.db'}")
-    else:
-        logger.warning("MLflow not available — install with: pip install mlflow==2.13.0")
 
+    # GPU check (torch/CUDA) only for modes that actually train models.
+    # Importing torch in a fresh process causes a Windows CUDA DLL conflict
+    # (0xC0000005) when PyTorch + TensorFlow both try to claim CUDA at startup.
+    # Modes that only run inference or backtesting skip the GPU check entirely.
     dispatch = {
-        "fetch":      run_fetch,
-        "load":       run_load,
-        "features":   run_features,
-        "strategy":   run_strategy,
-        "train":      run_train,
-        "train-v2":   run_train_v2,
-        "train-lstm": run_train_lstm,
-        "train-rl":   run_train_rl,
-        "optimize":   run_optimize,
-        "compare":    run_compare,
-        "wfv":        run_wfv,
-        "evaluate":   run_evaluate,
-        "report":     run_report,
-        "full":       run_full,
+        "fetch":      lambda: step_fetch(args.force),
+        "load":       lambda: step_load_and_display(),
+        "features":   lambda: step_features(args.force),
+        "strategy":   lambda: step_strategy(args.force),
+        "train":      lambda: (step_gpu_check(), step_train(args.force, args.trials, not args.no_optuna)),
+        "train-v2":   lambda: (step_gpu_check(), step_train_v2(args.force, args.trials, not args.no_optuna)),
+        "train-lstm": lambda: (step_gpu_check(), step_train_lstm(args.force)),
+        "train-rl":   lambda: (step_gpu_check(), step_train_rl(args.force, args.timesteps)),
+        "optimize":   lambda: step_optimize(args.force),
+        "compare":    lambda: step_compare(args.force),
+        "wfv":        lambda: step_wfv(args.force, args.trials),
+        "evaluate":   lambda: step_evaluate(args.force),
+        "report":     lambda: step_report(args.force),
+        "full": lambda: (
+            step_fetch(args.force),
+            step_gpu_check(),
+            step_features(args.force),
+            step_strategy(args.force),
+            step_train(args.force, args.trials, not args.no_optuna),
+            step_train_v2(args.force, args.trials, not args.no_optuna),
+            step_optimize(args.force),
+            step_wfv(args.force, args.trials),
+            step_evaluate(args.force),
+            step_compare(args.force),
+            step_report(args.force),
+        ),
     }
-    dispatch[args.mode](args)
+    dispatch[args.mode]()
 
 
 if __name__ == "__main__":

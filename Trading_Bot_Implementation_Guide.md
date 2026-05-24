@@ -2,7 +2,7 @@
 
 **Target:** CryptoTradingBot (BTC/USD) → Multi-Asset System  
 **Stack:** Python 3.11 | Windows | i5-12400F | RTX 3060 8GB | 16GB RAM  
-**Last Updated:** 2025
+**Last Updated:** April 2026
 
 ---
 
