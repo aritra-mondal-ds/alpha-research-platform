@@ -47,3 +47,5 @@ pydantic==2.7.1
 loguru==0.7.3
 pytest==8.2.0
 mlflow==2.13.0
+
+metatrader5==5.0.0

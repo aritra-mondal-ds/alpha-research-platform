@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Trading-Bot/main.py
+# TradingBot/main.py
 """
 Multi-Asset Trading Bot — Top-Level Orchestrator
 
