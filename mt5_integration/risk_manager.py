@@ -1,10 +1,12 @@
 # mt5_integration/risk_manager.py
 """
-ATR-based position sizing and portfolio risk management.
+ATR-based position sizing with broker minimum stop enforcement.
 
-    stop_distance  = atr_price × stop_atr_mult
-    risk_amount    = equity × risk_pct
-    lot_size       = risk_amount / (stop_ticks × tick_value)
+STOPS_BUFFER 1.5 → 2.0:
+    retcode=10016 (INVALID_STOPS) appeared twice on June 5 at 14:55 for
+    AUDUSD and XAUUSD. The spread widens slightly between signal time and
+    order execution, pushing the stop inside the broker's freeze level.
+    2× buffer gives enough headroom to survive spread widening at entry.
 """
 
 import math
@@ -12,6 +14,8 @@ from dataclasses import dataclass
 from loguru import logger
 
 from mt5_config import ASSETS, MAX_TOTAL_RISK_PCT, MAX_DRAWDOWN_PCT, MIN_EQUITY
+
+STOPS_BUFFER = 2.0   # was 1.5 — 2× broker minimum stop to absorb spread widening
 
 
 @dataclass
@@ -46,31 +50,44 @@ class RiskManager:
 
         cfg = ASSETS.get(symbol, {})
 
-        # ── Safety gates ──────────────────────────────────────────────────────
         if self._halted:
             logger.warning(f"{symbol}: Trading halted.")
             return None
         if equity < MIN_EQUITY:
-            logger.warning(f"{symbol}: Equity ${equity:.2f} < minimum ${MIN_EQUITY}.")
+            logger.warning(f"{symbol}: Equity ${equity:.2f} < minimum.")
             return None
         if open_risk_pct + cfg.get("risk_pct", 0.01) > MAX_TOTAL_RISK_PCT:
-            logger.warning(f"{symbol}: Portfolio risk limit reached. Trade skipped.")
+            logger.warning(f"{symbol}: Portfolio risk limit reached.")
             return None
         drawdown = (self._session_start_equity - equity) / self._session_start_equity
         if drawdown >= MAX_DRAWDOWN_PCT:
             self._halted = True
-            logger.error(f"HALT: session drawdown {drawdown*100:.1f}% ≥ limit.")
+            logger.error(f"HALT: drawdown {drawdown*100:.1f}%")
             return None
         if atr_pct <= 0:
-            logger.warning(f"{symbol}: ATR is zero — cannot size position.")
+            logger.warning(f"{symbol}: ATR=0 — skipping.")
             return None
 
-        # ── Levels ────────────────────────────────────────────────────────────
-        atr_price     = entry_price * atr_pct
-        stop_dist     = atr_price * cfg.get("stop_atr_mult", 2.0)
-        tp_dist       = atr_price * cfg.get("tp_atr_mult",   3.0)
-        digits        = symbol_info["digits"]
+        # ── Stop and TP distances ─────────────────────────────────────────────
+        atr_price = entry_price * atr_pct
+        stop_dist = atr_price * cfg.get("stop_atr_mult", 1.5)
+        tp_dist   = atr_price * cfg.get("tp_atr_mult",   2.0)
 
+        # Enforce broker minimum stop (retcode=10016 prevention)
+        point       = symbol_info.get("point", 0.00001)
+        stops_level = symbol_info.get("stops_level", 0)
+        if stops_level > 0:
+            min_stop = stops_level * point * STOPS_BUFFER
+            if stop_dist < min_stop:
+                logger.debug(
+                    f"{symbol}: Widening stop {stop_dist:.6f} → {min_stop:.6f} "
+                    f"(broker min × {STOPS_BUFFER})"
+                )
+                tp_ratio  = cfg.get("tp_atr_mult", 2.0) / cfg.get("stop_atr_mult", 1.5)
+                stop_dist = min_stop
+                tp_dist   = stop_dist * tp_ratio
+
+        digits = symbol_info["digits"]
         if direction == 1:
             sl = round(entry_price - stop_dist, digits)
             tp = round(entry_price + tp_dist,   digits)
@@ -78,12 +95,12 @@ class RiskManager:
             sl = round(entry_price + stop_dist, digits)
             tp = round(entry_price - tp_dist,   digits)
 
-        # ── Lot size ──────────────────────────────────────────────────────────
-        risk_amt      = equity * cfg.get("risk_pct", 0.01)
-        tick_size     = symbol_info["trade_tick_size"]
-        tick_value    = symbol_info["trade_tick_value"]
-        ticks_to_stop = stop_dist / tick_size
-        dollar_per_lot= ticks_to_stop * tick_value
+        # ── Lot sizing ────────────────────────────────────────────────────────
+        risk_amt       = equity * cfg.get("risk_pct", 0.01)
+        tick_size      = symbol_info["trade_tick_size"]
+        tick_value     = symbol_info["trade_tick_value"]
+        ticks_to_stop  = stop_dist / tick_size
+        dollar_per_lot = ticks_to_stop * tick_value
 
         if dollar_per_lot <= 0:
             logger.warning(f"{symbol}: Invalid tick value.")
@@ -91,15 +108,11 @@ class RiskManager:
 
         vol_step = symbol_info["volume_step"]
         lots     = math.floor((risk_amt / dollar_per_lot) / vol_step) * vol_step
-        lots     = max(symbol_info["volume_min"],
-                   min(symbol_info["volume_max"], lots))
+        lots     = round(max(symbol_info["volume_min"],
+                         min(symbol_info["volume_max"], lots)), 2)
 
         if lots <= 0:
-            logger.warning(
-                f"{symbol}: Lot size rounds to 0 "
-                f"(risk {risk_amt:.2f} / {dollar_per_lot:.2f} per lot). "
-                f"Increase risk_pct or account size."
-            )
+            logger.warning(f"{symbol}: Lot size = 0.")
             return None
 
         actual_risk_pct = (lots * dollar_per_lot) / equity

@@ -1,12 +1,17 @@
 # mt5_integration/live_trader.py
 """
-High-frequency live trader — 5-minute loop, 100+ trades/day target.
+Live Trading Loop — 1h XGBoost v2 strategy.
 
-Changes vs hourly version:
-    - Loop runs every 5 minutes (was every 1 hour)
-    - Multiple positions per asset allowed (max_open_trades from config)
-    - Tracks per-asset trade count for daily reporting
-    - Displays running P&L and trade stats each cycle
+Logger fix (this revision):
+    loguru's {time} defaults to local system time. On this machine that
+    was 2 hours ahead of UTC, causing log line prefixes to disagree with
+    the UTC cycle banner and making manual log analysis confusing.
+    A patcher now forces all log timestamps to true UTC, matching the
+    UTC-based trading logic used everywhere else in the bot.
+
+Deal history reconciliation (previous revision, retained):
+    executor.get_closed_deals() surfaces broker-triggered SL/TP closes
+    that close_position() never sees on its own.
 
 Usage:
     python live_trader.py                 # live trading
@@ -19,43 +24,39 @@ import time
 import argparse
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
 from loguru import logger
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mt5_config    import ASSETS, LOG_DIR, MAX_DRAWDOWN_PCT
+from mt5_config    import ASSETS, LOG_DIR
 from data_feed     import MT5DataFeed
 from signal_engine import SignalEngine
 from risk_manager  import RiskManager
 from executor      import MT5Executor
 
-LOOP_INTERVAL_SECONDS = 300     # 5 minutes = 300 seconds
+
+def _utc_patcher(record):
+    """Force loguru's {time} field to true UTC, overriding local system time."""
+    record["time"] = datetime.now(timezone.utc)
 
 
 def _setup_logger():
     logger.remove()
+    logger.configure(patcher=_utc_patcher)
     logger.add(
         sys.stdout, level="INFO",
-        format="<green>{time:HH:mm:ss}</green> | <level>{level:<8}</level> | {message}",
+        format="<green>{time:HH:mm:ss} UTC</green> | <level>{level:<8}</level> | {message}",
         colorize=True,
     )
     logger.add(
         str(LOG_DIR / "live_trader_{time:YYYY-MM-DD}.log"),
         rotation="00:00", retention="30 days", level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+        format="{time:YYYY-MM-DD HH:mm:ss} UTC | {level} | {message}",
     )
 
 
-def run_cycle(
-    feed:         MT5DataFeed,
-    engine:       SignalEngine,
-    risk_mgr:     RiskManager,
-    executor:     MT5Executor,
-    trade_counts: dict,
-    cycle_num:    int,
-) -> dict:
-    """Execute one 5-minute signal → execution cycle for all assets."""
+def run_cycle(feed, engine, risk_mgr, executor) -> dict:
+    """One full signal → execution cycle for all assets (called hourly)."""
     equity  = feed.account_equity()
     actions = {}
 
@@ -63,7 +64,17 @@ def run_cycle(
         logger.error("Drawdown limit reached — skipping cycle.")
         return {}
 
-    # ── 1. Fetch 5m primary bars + 1d macro for all assets ───────────────────
+    logger.info(
+        f"{'─'*55}\n"
+        f"  CYCLE  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  |  "
+        f"Equity: ${equity:,.2f}\n"
+        f"{'─'*55}"
+    )
+
+    # ── 0. Reconcile broker-triggered closes (SL/TP hits we didn't initiate) ──
+    executor.get_closed_deals(lookback_hours=2)
+
+    # ── 1. Fetch bars ──────────────────────────────────────────────────────────
     live_data = {}
     for symbol, cfg in ASSETS.items():
         try:
@@ -74,7 +85,7 @@ def run_cycle(
             logger.error(f"{symbol}: Data fetch failed — {e}")
 
     if not live_data:
-        logger.error("No data fetched — skipping cycle.")
+        logger.error("No data fetched — aborting cycle.")
         return {}
 
     # ── 2. Generate signals ───────────────────────────────────────────────────
@@ -85,29 +96,26 @@ def run_cycle(
     for symbol, signal in signals.items():
         cfg         = ASSETS[symbol]
         mt5_sym     = cfg["mt5_symbol"]
-        max_trades  = cfg.get("max_open_trades", 1)
-        open_pos    = executor.get_open_positions(mt5_sym)
-        n_open      = len(open_pos)
         current_dir = executor.get_position_direction(mt5_sym)
         desired_dir = signal.direction
         action      = "hold"
 
-        # Close positions that contradict the signal
+        if signal.strategy == "market_closed":
+            actions[symbol] = "market_closed"
+            continue
+
+        # Close if signal reversed or went flat
         if current_dir != 0 and current_dir != desired_dir:
             logger.info(
-                f"{symbol}: Signal reversed {_ds(current_dir)}→{_ds(desired_dir)} "
-                f"— closing {n_open} position(s)."
+                f"{symbol}: Signal changed {_ds(current_dir)}→{_ds(desired_dir)} "
+                f"— closing position."
             )
             ok     = executor.close_all_for_symbol(mt5_sym)
             action = "closed" if ok else "close_failed"
-            if ok:
-                trade_counts[symbol] += n_open
-            open_pos    = []
-            n_open      = 0
             current_dir = 0
 
-        # Open new position if signal is directional and below max_open_trades
-        if desired_dir != 0 and n_open < max_trades:
+        # Open new position if signal is directional and currently flat
+        if desired_dir != 0 and current_dir == 0:
             sym_info = feed.symbol_info(mt5_sym)
             params   = risk_mgr.compute_trade_params(
                 symbol=symbol, direction=desired_dir,
@@ -120,28 +128,21 @@ def run_cycle(
                 if ok:
                     action         = f"opened_{_ds(desired_dir)}"
                     open_risk_pct += params.risk_pct
-                    trade_counts[symbol] += 1
                 else:
                     action = "open_failed"
 
         actions[symbol] = action
 
-    # ── 4. Cycle summary (every 12 cycles = 1 hour) ──────────────────────────
-    if cycle_num % 12 == 0:
-        total_trades = sum(trade_counts.values())
-        all_pos      = executor.get_open_positions()
-        open_pnl     = sum(p.profit for p in all_pos)
-        logger.info(
-            f"{'─'*55}\n"
-            f"  HOURLY SUMMARY — Cycle {cycle_num} | "
-            f"{datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
-            f"  Equity: ${equity:,.2f} | Open P&L: ${open_pnl:+.2f}\n"
-            f"  Trades today: {total_trades} | "
-            f"Open positions: {len(all_pos)}\n"
-            f"  Per asset: " +
-            " | ".join(f"{s}: {n}" for s, n in trade_counts.items()) +
-            f"\n{'─'*55}"
-        )
+    # ── 4. Cycle summary ──────────────────────────────────────────────────────
+    all_pos  = executor.get_open_positions()
+    open_pnl = sum(p.profit for p in all_pos)
+    logger.info("  Actions this cycle:")
+    for sym, act in actions.items():
+        logger.info(f"    {sym:<12} → {act}")
+    logger.info(
+        f"  Open positions: {len(all_pos)} | Open P&L: ${open_pnl:+.2f} | "
+        f"Equity: ${feed.account_equity():,.2f}"
+    )
 
     return actions
 
@@ -150,30 +151,57 @@ def _ds(d: int) -> str:
     return {1: "LONG", -1: "SHORT", 0: "FLAT"}.get(d, "?")
 
 
-def _secs_to_next_5min() -> float:
-    """Seconds until the next 5-minute boundary (00, 05, 10, ...) plus 2s buffer."""
-    now     = datetime.now(timezone.utc)
-    minutes = now.minute
-    # Round up to next multiple of 5
-    next_m  = ((minutes // 5) + 1) * 5
-    if next_m >= 60:
-        next_dt = now.replace(minute=0, second=2, microsecond=0) + timedelta(hours=1)
-    else:
-        next_dt = now.replace(minute=next_m, second=2, microsecond=0)
-    return max(0.0, (next_dt - now).total_seconds())
+def _seconds_to_next_hour() -> float:
+    now       = datetime.now(timezone.utc)
+    next_hour = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
+    return max(0.0, (next_hour - now).total_seconds())
+
+
+def _print_open_positions_audit(executor):
+    """
+    Startup audit — list every currently open position for this bot's magic
+    number, including open time. Lets the user catch anything unexpected
+    (e.g. multiple concurrent positions on one asset) before trading resumes.
+    """
+    positions = executor.get_open_positions()
+    if not positions:
+        logger.info("Startup audit: no open positions.")
+        return
+
+    logger.info(f"Startup audit: {len(positions)} open position(s):")
+    for p in positions:
+        open_time = datetime.fromtimestamp(p.time, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        ptype     = "BUY" if p.type == 0 else "SELL"
+        logger.info(
+            f"    {p.symbol:<10} {ptype:<5} vol={p.volume} | "
+            f"opened={open_time} | SL={p.sl} TP={p.tp} | "
+            f"P&L=${p.profit:+.2f} | ticket={p.ticket}"
+        )
+
+    # Flag any asset with more than one open position — shouldn't happen
+    # given max_open_trades=1, but worth surfacing immediately if it does.
+    by_symbol: dict[str, int] = {}
+    for p in positions:
+        by_symbol[p.symbol] = by_symbol.get(p.symbol, 0) + 1
+    for sym, count in by_symbol.items():
+        if count > 1:
+            logger.warning(
+                f"{sym}: {count} concurrent positions open — "
+                f"expected at most 1. Review manually."
+            )
 
 
 def main():
     _setup_logger()
-    parser = argparse.ArgumentParser(description="MT5 High-Frequency Trader (5m)")
+    parser = argparse.ArgumentParser(description="MT5 Live Trader (1h XGBoost v2)")
     parser.add_argument("--dry-run", action="store_true", default=False)
     parser.add_argument("--once",    action="store_true", default=False)
     args = parser.parse_args()
 
     logger.info("═" * 55)
-    logger.info("  MULTI-ASSET ML TRADING BOT — 5m SCALPING")
+    logger.info("  MULTI-ASSET ML TRADING BOT — 1h XGBoost v2")
     logger.info(f"  Mode: {'DRY-RUN' if args.dry_run else 'LIVE'}")
-    logger.info(f"  Interval: every 5 minutes | Target: 100+ trades/day")
+    logger.info(f"  Interval: hourly")
     logger.info(f"  Assets: {', '.join(ASSETS.keys())}")
     logger.info("═" * 55)
 
@@ -186,45 +214,34 @@ def main():
         f"Leverage: 1:{acct['leverage']}"
     )
 
-    engine        = SignalEngine()
-    risk_mgr      = RiskManager(session_start_equity=acct["equity"])
-    executor      = MT5Executor(dry_run=args.dry_run)
-    trade_counts  = defaultdict(int)
-    cycle_num     = 0
+    engine   = SignalEngine()
+    risk_mgr = RiskManager(session_start_equity=acct["equity"])
+    executor = MT5Executor(dry_run=args.dry_run)
+
+    _print_open_positions_audit(executor)
 
     if args.once:
-        run_cycle(feed, engine, risk_mgr, executor, trade_counts, 0)
-        logger.info(f"Trades this cycle: {dict(trade_counts)}")
+        run_cycle(feed, engine, risk_mgr, executor)
         feed.shutdown()
         return
 
-    logger.info("Starting 5-minute loop. Press Ctrl+C to stop.")
+    logger.info("Starting hourly loop. Press Ctrl+C to stop.")
     try:
         while True:
-            cycle_num += 1
-            run_cycle(feed, engine, risk_mgr, executor, trade_counts, cycle_num)
+            run_cycle(feed, engine, risk_mgr, executor)
 
             if risk_mgr.is_halted:
                 logger.error("Halted — drawdown limit reached.")
                 break
 
-            wait    = _secs_to_next_5min()
-            next_dt = datetime.now(timezone.utc) + timedelta(seconds=wait)
-            logger.info(
-                f"Next cycle in {wait:.0f}s "
-                f"({next_dt.strftime('%H:%M:%S UTC')}) | "
-                f"Total trades today: {sum(trade_counts.values())}"
-            )
+            wait = _seconds_to_next_hour()
+            nxt  = datetime.now(timezone.utc) + timedelta(seconds=wait)
+            logger.info(f"Next cycle in {wait/60:.1f} min ({nxt.strftime('%H:%M UTC')})")
             time.sleep(wait)
 
     except KeyboardInterrupt:
         logger.info("Stopped by user.")
     finally:
-        total = sum(trade_counts.values())
-        logger.info(
-            f"Session summary: {total} total trades | "
-            f"Per asset: {dict(trade_counts)}"
-        )
         feed.shutdown()
 
 
