@@ -1,49 +1,36 @@
 # ============================================================
-# Trading-Bot / crypto — requirements.txt
-# Python 3.11.15 | Windows | Conda env: tradingbot
+# Quantitative Research Platform — requirements.txt
+# Python 3.11 | Windows / Linux / macOS
 # ============================================================
 
-# Data
-pandas==3.0.2
-numpy==1.26.4
-pyarrow==16.0.0
-requests==2.33.1
-ccxt==4.5.51
+# Core Data Engineering
+pandas>=2.2.0,<3.0.0
+numpy>=1.26.0,<2.0.0
+pyarrow>=15.0.0
+requests>=2.31.0
+ccxt>=4.2.0
+yfinance>=0.2.38
 
-# Technical Analysis
-ta==0.11.0
-pandas-ta==0.3.14b
-scipy==1.17.1
+# Technical Analysis (using 'ta' exclusively — avoids pandas-ta incompatibility)
+ta>=0.11.0
+scipy>=1.12.0
 
-# ML
-scikit-learn==1.8.0
-xgboost==3.2.0
-optuna==4.8.0
-shap==0.45.0
+# Machine Learning & Alpha Modeling
+scikit-learn>=1.4.0
+lightgbm>=4.3.0
+xgboost>=2.0.0
+optuna>=3.6.0
+shap>=0.45.0
 
-# Deep Learning / LSTM
-# IMPORTANT: Install via CUDA index, NOT plain pip install:
-# pip install torch==2.3.0+cu121 torchvision==0.18.0+cu121 --index-url https://download.pytorch.org/whl/cu121
-torch==2.3.0+cu121
-torchvision==0.18.0+cu121
-
-# Reinforcement Learning
-stable-baselines3[extra]==2.8.0
-gymnasium==1.2.3
-
-# Backtesting
-vectorbt==0.26.2
-
-# Experiment Tracking
-mlflow==2.13.0
+# Experiment Tracking & Logging
+loguru>=0.7.2
+mlflow>=2.12.0
 
 # Visualization
-matplotlib==3.10.9
-plotly==6.7.0
+matplotlib>=3.8.0
+plotly>=5.20.0
 
 # Utilities
-python-dotenv==1.2.2
-pydantic==2.7.1
-loguru==0.7.3
-pytest==8.2.0
-mlflow==2.13.0
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+pytest>=8.0.0

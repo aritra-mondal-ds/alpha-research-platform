@@ -7,9 +7,11 @@ Run this to find exactly which module-level import crashes main.py.
 Each import is tested independently. The one that fails shows the error.
 """
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 print("Python:", sys.version)

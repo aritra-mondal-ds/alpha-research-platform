@@ -60,7 +60,7 @@ class XGBoostTradingModelV2:
         X_val:    pd.DataFrame,
         y_val:    pd.Series,
         n_trials: int  = 50,
-        use_gpu:  bool = True,
+        use_gpu:  bool = False,
     ) -> "XGBoostTradingModelV2":
 
         # ── Step 1: Filter to stationary features only ────────────────────────
@@ -76,8 +76,18 @@ class XGBoostTradingModelV2:
 
         w_tr = self._compute_weights(y_tr)
         w_vl = self._compute_weights(y_vl)
-
         device = "cuda" if use_gpu else "cpu"
+
+
+
+
+
+
+
+
+
+
+
         logger.info(
             f"XGBoost v2 | device: {device} | "
             f"stationary features: {len(stationary)} | "
@@ -259,6 +269,12 @@ class XGBoostTradingModelV2:
         self.model.save_model(str(out_dir / "model.json"))
         with open(out_dir / "best_params.json", "w") as f:
             json.dump(self.best_params, f, indent=2)
+        with open(out_dir / "meta.json", "w") as f:
+            json.dump({
+                "feature_cols": list(self.feature_cols) if self.feature_cols is not None else [],
+                "threshold": float(self.threshold),
+                "version": self.VERSION,
+            }, f, indent=2)
         with open(out_dir / "meta.pkl", "wb") as f:
             pickle.dump({
                 "feature_cols": self.feature_cols,

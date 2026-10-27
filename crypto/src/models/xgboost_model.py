@@ -71,6 +71,14 @@ class XGBoostTradingModel:
         w_tr = self._compute_weights(y_tr)
         w_vl = self._compute_weights(y_vl)
 
+        if use_gpu:
+            try:
+                import torch
+                if not torch.cuda.is_available():
+                    use_gpu = False
+            except Exception:
+                use_gpu = False
+
         device = "cuda" if use_gpu else "cpu"
         logger.info(f"XGBoost — device: {device}")
         logger.info(
@@ -263,6 +271,11 @@ class XGBoostTradingModel:
         self.model.save_model(str(out_dir / "model.json"))
         with open(out_dir / "best_params.json", "w") as f:
             json.dump(self.best_params, f, indent=2)
+        with open(out_dir / "meta.json", "w") as f:
+            json.dump({
+                "feature_cols": list(self.feature_cols) if self.feature_cols is not None else [],
+                "threshold": float(self.threshold),
+            }, f, indent=2)
         with open(out_dir / "meta.pkl", "wb") as f:
             pickle.dump({
                 "feature_cols": self.feature_cols,

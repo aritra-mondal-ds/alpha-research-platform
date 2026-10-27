@@ -217,7 +217,7 @@ class SimpleBacktester:
         m["period"]           = f"{df.index[0].date()} → {df.index[-1].date()}"
 
         # ── Risk-adjusted ─────────────────────────────────────────────────────
-        r    = returns.replace(0, np.nan).dropna()
+        r    = returns
         mean = r.mean() * ann
         std  = r.std()  * np.sqrt(ann)
         downside = r[r < 0].std() * np.sqrt(ann)

@@ -33,6 +33,10 @@ Lazy import strategy:
 
 import argparse
 import sys
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 import json
 from pathlib import Path
 from datetime import datetime
@@ -195,7 +199,7 @@ def step_train(force=False, n_trials=50, use_optuna=True):
             "subsample": 0.8, "colsample_bytree": 0.8,
             "objective": "multi:softprob", "num_class": 3,
             "eval_metric": "mlogloss", "tree_method": "hist",
-            "device": "cuda", "seed": cfg.RANDOM_SEED, "verbosity": 0,
+            "device": "cpu", "seed": cfg.RANDOM_SEED, "verbosity": 0,
         }
         model.best_params = p
         model.model = xgb.XGBClassifier(**p, early_stopping_rounds=30)
@@ -238,7 +242,7 @@ def step_train_v2(force=False, n_trials=50, use_optuna=True):
             "reg_alpha": 2.0, "reg_lambda": 5.0, "min_child_weight": 20,
             "gamma": 3.0, "objective": "multi:softprob", "num_class": 3,
             "eval_metric": "mlogloss", "tree_method": "hist",
-            "device": "cuda", "seed": cfg.RANDOM_SEED, "verbosity": 0,
+            "device": "cpu", "seed": cfg.RANDOM_SEED, "verbosity": 0,
         }
         model_v2.best_params = p
         model_v2.model = xgb.XGBClassifier(**p, early_stopping_rounds=20)
@@ -259,6 +263,28 @@ def step_train_v2(force=False, n_trials=50, use_optuna=True):
                     "XGBoost v2")
     _display_strategy_comparison({"XGBoost v2": res})
     return model_v2, res
+
+
+def step_train_lgb(force=False, n_trials=50, use_optuna=True):
+    from src.models.lightgbm_model import LightGBMTradingModel
+
+    logger.info("STEP — LightGBM Training (CPU-Optimized, Stationary)")
+    split, feat_cols, X_tr, y_tr, X_vl, y_vl, X_te, y_te = \
+        _get_split_and_arrays(force)
+
+    model_lgb = LightGBMTradingModel(use_stationary_only=True)
+    model_lgb.train(X_tr, y_tr, X_vl, y_vl, n_trials=n_trials)
+
+    model_lgb.evaluate(X_te, y_te, "Test")
+    model_lgb.feature_importance(top_n=20)
+
+    X_te_s = X_te[model_lgb.feature_cols]
+    bt     = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
+    res    = bt.run(split.test,
+                    signals_to_positions(pd.Series(model_lgb.predict(X_te_s), index=split.test.index)),
+                    "LightGBM")
+    _display_strategy_comparison({"LightGBM": res})
+    return model_lgb, res
 
 
 def step_train_lstm(force=False):
@@ -299,6 +325,7 @@ def step_train_rl(force=False, total_timesteps=500_000):
 def step_optimize(force=False):
     from src.models.xgboost_model import XGBoostTradingModel
     from src.models.xgboost_v2   import XGBoostTradingModelV2
+    from src.models.lightgbm_model import LightGBMTradingModel
     from src.backtesting.metrics  import check_overfitting, monte_carlo_simulation
 
     logger.info("STEP — Optimization Analysis")
@@ -389,23 +416,32 @@ def step_wfv(force=False, n_trials=20):
 
 
 def step_evaluate(force=False):
+    from src.models.xgboost_v2   import XGBoostTradingModelV2
     from src.models.xgboost_model import XGBoostTradingModel
     from src.backtesting.metrics  import check_overfitting, monte_carlo_simulation
 
     logger.info("STEP — Evaluate: Overfitting Check + Monte Carlo")
     split, feat_cols, X_tr, y_tr, X_vl, y_vl, X_te, y_te = \
         _get_split_and_arrays(force)
+    model = None
+    model_name = "XGBoost v2"
     try:
-        model = XGBoostTradingModel().load()
+        model = XGBoostTradingModelV2().load()
     except FileNotFoundError:
-        logger.error("XGBoost model not found — run --mode train first")
-        return
+        try:
+            model = XGBoostTradingModel().load()
+            model_name = "XGBoost v1"
+        except FileNotFoundError:
+            logger.error("No XGBoost model found — run --mode train-v2 first")
+            return
 
     bt         = SimpleBacktester(cfg.INITIAL_CAPITAL, cfg.COMMISSION, cfg.SLIPPAGE)
-    train_sigs = pd.Series(model.predict(X_tr), index=split.train.index)
-    test_sigs  = pd.Series(model.predict(X_te), index=split.test.index)
-    train_res  = bt.run(split.train, signals_to_positions(train_sigs), "Train")
-    test_res   = bt.run(split.test,  signals_to_positions(test_sigs),  "Test")
+    x_tr = X_tr[model.feature_cols] if (hasattr(model, "feature_cols") and model.feature_cols and set(model.feature_cols).issubset(X_tr.columns)) else X_tr
+    x_te = X_te[model.feature_cols] if (hasattr(model, "feature_cols") and model.feature_cols and set(model.feature_cols).issubset(X_te.columns)) else X_te
+    train_sigs = pd.Series(model.predict(x_tr), index=split.train.index)
+    test_sigs  = pd.Series(model.predict(x_te), index=split.test.index)
+    train_res  = bt.run(split.train, signals_to_positions(train_sigs), f"{model_name} Train")
+    test_res   = bt.run(split.test,  signals_to_positions(test_sigs),  f"{model_name} Test")
 
     check_overfitting(train_res.metrics, test_res.metrics, threshold=0.5)
 
@@ -419,6 +455,7 @@ def step_evaluate(force=False):
 def step_compare(force=False):
     from src.models.xgboost_model import XGBoostTradingModel
     from src.models.xgboost_v2   import XGBoostTradingModelV2
+    from src.models.lightgbm_model import LightGBMTradingModel
 
     logger.info("STEP — Full Model Comparison")
     split, feat_cols, _, _, _, _, X_te, y_te = _get_split_and_arrays(force)
@@ -428,6 +465,7 @@ def step_compare(force=False):
 
     # ── ML models (XGBoost only — LSTM import skipped to avoid CUDA crash) ───
     for name, loader_fn in [
+        ("LightGBM",   lambda: LightGBMTradingModel().load()),
         ("XGBoost v1", lambda: XGBoostTradingModel().load()),
         ("XGBoost v2", lambda: XGBoostTradingModelV2().load()),
     ]:
@@ -554,7 +592,7 @@ def main():
         "--mode",
         choices=[
             "fetch","load","features","strategy",
-            "train","train-v2","train-lstm","train-rl",
+            "train","train-v2","train-lgb","train-lstm","train-rl",
             "optimize","compare","wfv","evaluate","report","full",
         ],
         default="full",
@@ -579,8 +617,9 @@ def main():
         "load":       lambda: step_load_and_display(),
         "features":   lambda: step_features(args.force),
         "strategy":   lambda: step_strategy(args.force),
-        "train":      lambda: (step_gpu_check(), step_train(args.force, args.trials, not args.no_optuna)),
-        "train-v2":   lambda: (step_gpu_check(), step_train_v2(args.force, args.trials, not args.no_optuna)),
+        "train":      lambda: step_train(args.force, args.trials, not args.no_optuna),
+        "train-v2":   lambda: step_train_v2(args.force, args.trials, not args.no_optuna),
+        "train-lgb":  lambda: step_train_lgb(args.force, args.trials, not args.no_optuna),
         "train-lstm": lambda: (step_gpu_check(), step_train_lstm(args.force)),
         "train-rl":   lambda: (step_gpu_check(), step_train_rl(args.force, args.timesteps)),
         "optimize":   lambda: step_optimize(args.force),
@@ -590,7 +629,6 @@ def main():
         "report":     lambda: step_report(args.force),
         "full": lambda: (
             step_fetch(args.force),
-            step_gpu_check(),
             step_features(args.force),
             step_strategy(args.force),
             step_train(args.force, args.trials, not args.no_optuna),

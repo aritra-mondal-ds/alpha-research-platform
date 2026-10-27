@@ -62,7 +62,7 @@ def compute_full_metrics(
     m["period_end"]          = str(df.index[-1].date())
 
     # ── Risk-adjusted ─────────────────────────────────────────────────────────
-    r_clean = returns.replace(0, np.nan).dropna()
+    r_clean = returns
     mu      = r_clean.mean() * ann_factor
     sigma   = r_clean.std()  * np.sqrt(ann_factor)
     down_sd = r_clean[r_clean < 0].std() * np.sqrt(ann_factor)

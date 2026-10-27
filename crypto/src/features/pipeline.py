@@ -2,15 +2,10 @@
 """
 Feature pipeline orchestrator.
 
-Fixes vs original:
-    _merge_macro() now uses reindex(method='ffill') instead of
-    resample().join(). This handles any trading schedule:
-        - Crypto:      24/7  (UTC-aligned hourly bars)
-        - Forex:       24/5  (UTC-aligned, no weekends)
-        - NYSE stocks: 9:30-16:00 ET (bars at :30-minute offset from UTC)
-    The old resample+join approach created a UTC-aligned hourly grid
-    that never matched NYSE timestamps (13:30, 14:30 UTC), producing
-    all-NaN daily features and 0 rows after dropna().
+Institutional Enhancements:
+    - Dynamic Triple-Barrier Method labeling (volatility scaled)
+    - Macro daily feature forward-fill with reindex(method='ffill')
+    - Strict lookahead bias prevention
 """
 
 import sys
@@ -39,12 +34,13 @@ class FeaturePipeline:
 
     def run(
         self,
-        symbol:      str   = cfg.SYMBOL,
-        primary_tf:  str   = cfg.PRIMARY_TF,
-        higher_tf:   str   = cfg.HIGHER_TF,
-        horizon:     int   = 12,
-        threshold:   float = 0.015,
-        save:        bool  = True,
+        symbol:        str   = cfg.SYMBOL,
+        primary_tf:    str   = cfg.PRIMARY_TF,
+        higher_tf:     str   = cfg.HIGHER_TF,
+        horizon:       int   = 12,
+        threshold:     float = 0.015,
+        target_method: str   = "triple_barrier",
+        save:          bool  = True,
     ) -> pd.DataFrame:
         global FEATURE_COLS
 
@@ -86,13 +82,21 @@ class FeaturePipeline:
             df_1h = self._merge_macro(df_1h, df_1d_feats)
 
         # ── Build target label ────────────────────────────────────────────────
-        logger.info(
-            f"Building classification target "
-            f"[horizon={horizon}h, threshold=±{threshold*100:.1f}%] ..."
-        )
-        df_1h["target"] = self.targets.build_classification(
-            df_1h, horizon=horizon, threshold=threshold
-        )
+        if target_method == "triple_barrier":
+            logger.info(
+                f"Building dynamic Triple-Barrier target [horizon={horizon}h, volatility scaled] ..."
+            )
+            df_1h["target"] = self.targets.build_triple_barrier(
+                df_1h, pt_mult=2.0, sl_mult=1.5, max_holding=horizon
+            )
+        else:
+            logger.info(
+                f"Building fixed classification target "
+                f"[horizon={horizon}h, threshold=±{threshold*100:.1f}%] ..."
+            )
+            df_1h["target"] = self.targets.build_classification(
+                df_1h, horizon=horizon, threshold=threshold
+            )
 
         # ── Drop NaN (warmup + last horizon rows) ─────────────────────────────
         before = len(df_1h)
@@ -132,20 +136,6 @@ class FeaturePipeline:
     ) -> pd.DataFrame:
         """
         Forward-fill daily indicator values into the primary (1h) DataFrame.
-
-        Uses reindex(method='ffill') instead of resample().join() so that
-        ANY trading schedule works correctly:
-
-            Crypto  (24/7)  → bars at 00:00, 01:00 ... 23:00 UTC  ✓
-            Forex   (24/5)  → bars at 00:00, 01:00 ... 23:00 UTC  ✓
-            NYSE    (9:30-16:00 ET) → bars at 13:30, 14:30 UTC   ✓ (was broken)
-
-        The old approach used resample("1h").ffill() which created an exact
-        hourly grid at :00 minutes. NYSE bars fall at :30 minutes, so the
-        join produced all-NaN daily features for stocks/ETFs.
-
-        reindex(method='ffill') maps each daily value to the nearest
-        PRECEDING bar in df_primary, regardless of the exact minute offset.
         """
         daily_indicator_cols = [
             "ema_50", "ema_200", "rsi_14", "atr_pct",
@@ -155,13 +145,9 @@ class FeaturePipeline:
         available = [c for c in daily_indicator_cols if c in df_daily.columns]
         daily_sub = df_daily[available].add_prefix("d1_")
 
-        # Sort by index (should already be sorted, but be safe)
         daily_sub   = daily_sub.sort_index()
         df_out      = df_primary.copy()
 
-        # Reindex: for each primary-tf timestamp, use the most recent daily value
-        # method='ffill' → carry forward the last known daily bar
-        # tolerance is not set → any gap is filled (daily values persist for days)
         daily_reindexed = daily_sub.reindex(
             df_out.index, method="ffill"
         )
@@ -169,7 +155,6 @@ class FeaturePipeline:
         for col in daily_reindexed.columns:
             df_out[col] = daily_reindexed[col].values
 
-        # Diagnostic: count remaining NaN in daily feature columns
         nan_count = df_out[daily_reindexed.columns].isnull().sum().sum()
         if nan_count > 0:
             logger.warning(

@@ -2,18 +2,11 @@
 """
 Walk-Forward Validation (WFV) for time-series trading strategies.
 
-Why WFV instead of a single train/test split:
-    A single split tells you performance on ONE market regime.
-    WFV rolls the training window forward, testing on unseen data
-    at each step, producing N out-of-sample performance samples.
-    This reveals whether performance is consistent or regime-specific.
-
-Two modes:
-    Expanding window:  train grows each fold (more data over time)
-    Rolling window:    train stays fixed size (recent data emphasis)
-
-For XGBoost — this is the primary use case.
-For rule-based strategies — no retraining needed, just evaluate each fold.
+Institutional Enhancements:
+    - Purged & Embargoed Cross-Validation (López de Prado standard)
+    - Zero label leakage between train/val and train/test splits
+    - CPU/GPU execution safety toggles
+    - Support for both LightGBM and XGBoost models
 """
 
 import sys
@@ -63,14 +56,18 @@ class WFVReport:
 
     @property
     def mean_sharpe(self) -> float:
-        return float(np.mean([f.metrics.get("sharpe", 0) for f in self.folds]))
+        sharpes = [f.metrics.get("sharpe", 0) for f in self.folds]
+        return float(np.mean(sharpes)) if sharpes else 0.0
 
     @property
     def mean_return(self) -> float:
-        return float(np.mean([f.metrics.get("total_return_pct", 0) for f in self.folds]))
+        returns = [f.metrics.get("total_return_pct", 0) for f in self.folds]
+        return float(np.mean(returns)) if returns else 0.0
 
     @property
     def pct_profitable_folds(self) -> float:
+        if not self.folds:
+            return 0.0
         wins = sum(1 for f in self.folds if f.metrics.get("total_return_pct", 0) > 0)
         return wins / len(self.folds) * 100
 
@@ -118,13 +115,14 @@ class WFVReport:
 # ── Walk-Forward Runner ───────────────────────────────────────────────────────
 class WalkForwardValidator:
     """
-    Runs walk-forward validation for any strategy or ML model.
+    Runs walk-forward validation with strict purging to prevent future-data leakage.
 
     Args:
         train_window_h: Training window in hours (default: 17520 = 2 years)
         test_window_h:  Test window in hours    (default: 4380 = 6 months)
         step_h:         Roll-forward step size  (default: 4380 = 6 months)
         mode:           "expanding" or "rolling"
+        purge_h:        Purge window in hours to strip overlapping target labels (default: 12)
     """
 
     def __init__(
@@ -133,6 +131,7 @@ class WalkForwardValidator:
         test_window_h:  int =  4_380,    # 6 months
         step_h:         int =  4_380,    # roll forward 6 months each fold
         mode:           str = "expanding",
+        purge_h:        int = 12,        # purge overlapping future label bars
     ):
         assert mode in ("expanding", "rolling"), \
             "mode must be 'expanding' or 'rolling'"
@@ -140,16 +139,17 @@ class WalkForwardValidator:
         self.test_window_h  = test_window_h
         self.step_h         = step_h
         self.mode           = mode
+        self.purge_h        = purge_h
 
     def run_xgboost(
         self,
         df:           pd.DataFrame,
         feat_cols:    list,
-        n_trials:     int = 20,    # fewer trials per fold for speed
+        n_trials:     int  = 20,
+        use_gpu:      bool = False,
     ) -> WFVReport:
         """
-        Walk-forward validation for XGBoost.
-        Re-trains model from scratch on each fold's training data.
+        Walk-forward validation for XGBoost with purged validation splits.
         """
         from src.models.xgboost_model import XGBoostTradingModel
         from src.backtesting.simple_backtest import SimpleBacktester
@@ -158,23 +158,25 @@ class WalkForwardValidator:
         folds  = self._make_folds(df)
         logger.info(
             f"XGBoost WFV — {len(folds)} folds | "
-            f"mode: {self.mode} | Optuna trials per fold: {n_trials}"
+            f"mode: {self.mode} | purge: {self.purge_h}h | trials: {n_trials} | gpu: {use_gpu}"
         )
 
         results = []
         for i, (train_df, test_df) in enumerate(folds, 1):
             logger.info(f"Fold {i}/{len(folds)} — training XGBoost ...")
 
-            X_tr = train_df[feat_cols]
-            y_tr = train_df["target"].astype(int)
-            # Use last 20% of training as validation for early stopping
-            val_split = int(len(X_tr) * 0.8)
-            X_vl, y_vl = X_tr.iloc[val_split:], y_tr.iloc[val_split:]
-            X_tr, y_tr = X_tr.iloc[:val_split], y_tr.iloc[:val_split]
+            X_raw = train_df[feat_cols]
+            y_raw = train_df["target"].astype(int)
+
+            # Purged validation split: last 20% for validation, drop purge_h overlap
+            val_split = int(len(X_raw) * 0.8)
+            purge_bound = max(0, val_split - self.purge_h)
+
+            X_tr, y_tr = X_raw.iloc[:purge_bound], y_raw.iloc[:purge_bound]
+            X_vl, y_vl = X_raw.iloc[val_split:], y_raw.iloc[val_split:]
 
             model = XGBoostTradingModel()
-            model.train(X_tr, y_tr, X_vl, y_vl,
-                        n_trials=n_trials, use_gpu=True)
+            model.train(X_tr, y_tr, X_vl, y_vl, n_trials=n_trials, use_gpu=use_gpu)
 
             X_te = test_df[feat_cols]
             sigs = pd.Series(
@@ -245,7 +247,7 @@ class WalkForwardValidator:
         self, df: pd.DataFrame
     ) -> List[tuple[pd.DataFrame, pd.DataFrame]]:
         """
-        Generate (train_df, test_df) pairs for all folds.
+        Generate (train_df, test_df) pairs with strict purging of overlapping labels.
         """
         folds  = []
         start  = 0
@@ -256,13 +258,19 @@ class WalkForwardValidator:
             test_end   = train_end + self.test_window_h
 
             if self.mode == "expanding":
-                train_df = df.iloc[:train_end].copy()     # grows each fold
+                raw_train = df.iloc[:train_end].copy()
             else:
-                train_df = df.iloc[start:train_end].copy()  # fixed size
+                raw_train = df.iloc[start:train_end].copy()
+
+            # Purge the last purge_h bars of train_df to eliminate lookahead label leakage
+            if self.purge_h > 0 and len(raw_train) > self.purge_h:
+                train_df = raw_train.iloc[:-self.purge_h].copy()
+            else:
+                train_df = raw_train
 
             test_df = df.iloc[train_end:test_end].copy()
 
-            if len(test_df) >= 100:   # skip folds with too little test data
+            if len(test_df) >= 100:
                 folds.append((train_df, test_df))
 
             start += self.step_h
@@ -274,5 +282,5 @@ class WalkForwardValidator:
                 f"Try reducing train_window_h or test_window_h."
             )
 
-        logger.info(f"Generated {len(folds)} walk-forward folds")
+        logger.info(f"Generated {len(folds)} purged walk-forward folds (purge={self.purge_h}h)")
         return folds

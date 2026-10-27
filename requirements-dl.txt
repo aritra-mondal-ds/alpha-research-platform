@@ -1,0 +1,8 @@
+# Optional Deep Learning & Reinforcement Learning Requirements
+# Install with:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# pip install -r requirements-dl.txt
+
+stable-baselines3[extra]>=2.3.0
+gymnasium>=0.29.0
+

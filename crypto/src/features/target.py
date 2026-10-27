@@ -117,6 +117,78 @@ class TargetBuilder:
             )
         return pd.DataFrame(targets, index=df.index)
 
+    def build_triple_barrier(
+        self,
+        df: pd.DataFrame,
+        pt_mult: float = 2.0,
+        sl_mult: float = 1.5,
+        max_holding: int = 12,
+        vol_col: str = "atr_pct",
+    ) -> pd.Series:
+        """
+        Institutional Triple-Barrier Method (Marcos López de Prado).
+        Dynamically scales upper (take profit) and lower (stop loss) barriers
+        based on volatility (e.g. ATR % or rolling returns standard deviation).
+
+        Labels:
+            +1 (LONG) : Upper barrier touched first
+            -1 (SHORT): Lower barrier touched first
+             0 (HOLD) : Vertical barrier (max holding limit) reached before touch
+        """
+        close = df["close"].values
+        high = df["high"].values if "high" in df.columns else close
+        low = df["low"].values if "low" in df.columns else close
+
+        if vol_col in df.columns:
+            vol = df[vol_col].values
+        else:
+            returns = np.log(df["close"] / df["close"].shift(1)).fillna(0)
+            vol = returns.rolling(24).std().fillna(returns.std()).values
+            vol = np.maximum(vol, 0.005)
+
+        n = len(df)
+        labels = np.zeros(n, dtype=float)
+
+        for i in range(n - max_holding):
+            p0 = close[i]
+            v = vol[i]
+            if np.isnan(v) or v <= 0:
+                v = 0.01
+
+            upper = p0 * (1.0 + pt_mult * v)
+            lower = p0 * (1.0 - sl_mult * v)
+
+            f_high = high[i + 1 : i + 1 + max_holding]
+            f_low = low[i + 1 : i + 1 + max_holding]
+
+            touch_upper = np.where(f_high >= upper)[0]
+            touch_lower = np.where(f_low <= lower)[0]
+
+            first_upper = touch_upper[0] if len(touch_upper) > 0 else 999999
+            first_lower = touch_lower[0] if len(touch_lower) > 0 else 999999
+
+            if first_upper < first_lower:
+                labels[i] = LONG
+            elif first_lower < first_upper:
+                labels[i] = SHORT
+            else:
+                labels[i] = HOLD
+
+        labels[-max_holding:] = np.nan
+        target = pd.Series(labels, index=df.index, name=f"target_tb_{max_holding}h")
+
+        valid = target.dropna()
+        counts = valid.value_counts().sort_index()
+        total = len(valid)
+        if total > 0:
+            logger.info(
+                f"Triple-Barrier Target [{max_holding}h | pt={pt_mult}x | sl={sl_mult}x] — "
+                f"LONG: {counts.get(LONG,0):,} ({counts.get(LONG,0)/total*100:.1f}%) | "
+                f"HOLD: {counts.get(HOLD,0):,} ({counts.get(HOLD,0)/total*100:.1f}%) | "
+                f"SHORT: {counts.get(SHORT,0):,} ({counts.get(SHORT,0)/total*100:.1f}%)"
+            )
+        return target
+
 
 # ── Convenience helpers ───────────────────────────────────────────────────────
 
